@@ -3,6 +3,7 @@ import requests
 from bs4 import BeautifulSoup
 import pandas as pd
 import html
+import re
 import time
 import json
 import os
@@ -13,7 +14,6 @@ from datetime import datetime, timedelta
 # ──────────────────────────────────────────────
 
 KNOWN_PLAYS_FILE = "kamil_pivot_emisje.json"
-NEW_PLAYS_FILE   = "kamil_pivot_nowe_emisje.csv"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -24,7 +24,31 @@ HEADERS = {
 st.set_page_config(page_title="Monitor emisji — Kamil Pivot", page_icon="🎵", layout="wide")
 
 # ──────────────────────────────────────────────
-# Znane emisje (bez zmian logicznych)
+# Normalizacja tytułów (dedup "Kamil Pivot" vs "Pivot Kamil" itp.)
+# ──────────────────────────────────────────────
+
+def normalize_title(title: str) -> str:
+    """
+    Zamienia tytuł na formę kanoniczną, niewrażliwą na:
+    - kolejność 'Artysta - Tytuł' vs 'Tytuł - Artysta'
+    - kolejność słów w nazwie, np. 'Kamil Pivot' vs 'Pivot Kamil'
+    """
+    title = html.unescape(title).strip().lower()
+    segments = [s.strip() for s in title.split(" - ")]
+
+    normalized_segments = []
+    for seg in segments:
+        words = re.findall(r"[a-ząćęłńóśźż0-9]+", seg)
+        normalized_segments.append(" ".join(sorted(words)))
+
+    normalized_segments.sort()
+    return " | ".join(normalized_segments)
+
+def make_play_key(canonical: str, date: str, time_: str, station: str) -> str:
+    return f"{canonical}|{date}|{time_}|{station}"
+
+# ──────────────────────────────────────────────
+# Znane emisje (do oznaczania 🆕)
 # ──────────────────────────────────────────────
 
 def load_known_plays() -> set:
@@ -36,9 +60,6 @@ def load_known_plays() -> set:
 def save_known_plays(known: set):
     with open(KNOWN_PLAYS_FILE, "w", encoding="utf-8") as f:
         json.dump(list(known), f, ensure_ascii=False, indent=2)
-
-def make_play_key(play: dict) -> str:
-    return f"{play['song_id']}|{play['date']}|{play['time']}|{play['station']}"
 
 # ──────────────────────────────────────────────
 # Scraping listy piosenek
@@ -152,7 +173,7 @@ st.title("🎵 Monitor emisji — Kamil Pivot")
 st.caption(f"🕐 {datetime.now().strftime('%d.%m.%Y %H:%M')}")
 
 known_plays = load_known_plays()
-st.info(f"📂 Znanych emisji w bazie: **{len(known_plays)}**")
+st.info(f"📂 Znanych (wcześniej wykrytych) emisji w bazie: **{len(known_plays)}**")
 
 days = st.number_input(
     "Z ilu ostatnich dni mają być emisje?",
@@ -167,77 +188,97 @@ if run:
                f"({days} {'dzień' if days == 1 else 'dni'})")
 
     log_box = st.expander("📜 Log przebiegu", expanded=False)
-    log_lines = []
 
     def log(msg: str):
-        log_lines.append(msg)
         log_box.write(msg)
 
     with st.spinner("Pobieram listę piosenek Kamila Pivota..."):
         all_songs = scrape_song_list("kamil pivot", log)
 
-    st.write(f"📋 Łącznie piosenek: **{len(all_songs)}**")
+    st.write(f"📋 Łącznie piosenek (wersji tytułów) do sprawdzenia: **{len(all_songs)}**")
 
-    all_new_plays     = []
-    all_current_plays = set()
-
-    progress = st.progress(0)
-    status   = st.empty()
+    raw_plays = []
+    progress  = st.progress(0)
+    status    = st.empty()
 
     for i, song in enumerate(all_songs, 1):
         status.write(f"[{i}/{len(all_songs)}] {song['title']}")
-
-        plays = scrape_song_plays(song, date_from)
-
-        for play in plays:
-            key = make_play_key(play)
-            all_current_plays.add(key)
-            if key not in known_plays:
-                all_new_plays.append(play)
-
+        raw_plays.extend(scrape_song_plays(song, date_from))
         progress.progress(i / len(all_songs))
         time.sleep(1)
 
     progress.empty()
     status.empty()
 
+    # ── Deduplikacja: różne warianty tego samego tytułu (np. odwrócona
+    # kolejność artysta/tytuł albo słów w nazwie) traktujemy jako jedną piosenkę,
+    # a te same emisje (ta sama data/godzina/stacja) liczymy tylko raz. ──
+    title_counts   = {}   # canonical -> {tytuł: liczba wystąpień}
+    dedup_plays    = {}   # (canonical, date, time, station) -> play dict
+    all_current_keys = set()
+
+    for p in raw_plays:
+        canonical = normalize_title(p["song_title"])
+        title_counts.setdefault(canonical, {})
+        title_counts[canonical][p["song_title"]] = title_counts[canonical].get(p["song_title"], 0) + 1
+
+        key = make_play_key(canonical, p["date"], p["time"], p["station"])
+        all_current_keys.add(key)
+
+        if key not in dedup_plays:
+            dedup_plays[key] = {**p, "canonical": canonical}
+
+    # Wybierz najczęściej występujący wariant tytułu jako "ładną" nazwę wyświetlaną
+    display_title = {
+        canonical: max(variants.items(), key=lambda kv: kv[1])[0]
+        for canonical, variants in title_counts.items()
+    }
+
+    final_plays = []
+    for key, p in dedup_plays.items():
+        final_plays.append({
+            "tytuł":   display_title[p["canonical"]],
+            "data":    p["date"],
+            "godzina": p["time"],
+            "stacja":  p["station"],
+            "nowa":    "🆕" if key not in known_plays else "",
+            "url":     p["song_url"],
+        })
+
     st.divider()
 
-    if not all_new_plays:
-        st.success(f"✅ Brak nowych emisji z ostatnich {days} dni!")
+    if not final_plays:
+        st.warning(f"Brak emisji z ostatnich {days} dni.")
     else:
-        st.subheader(f"🆕 Nowych emisji łącznie: {len(all_new_plays)}")
+        st.subheader(f"📊 Wszystkie emisje w wybranym okresie: {len(final_plays)} "
+                     f"(w tym 🆕 nowych: {sum(1 for p in final_plays if p['nowa'])})")
 
-        by_song = {}
-        for p in all_new_plays:
-            by_song.setdefault(p["song_title"], []).append(p)
+        by_title = {}
+        for p in final_plays:
+            by_title.setdefault(p["tytuł"], []).append(p)
 
-        for title, plays_list in sorted(by_song.items()):
-            with st.expander(f"🎵 {title} ({len(plays_list)} emisji)", expanded=True):
-                df_show = pd.DataFrame(sorted(plays_list, key=lambda x: (x["date"], x["time"])))
-                st.dataframe(df_show[["date", "time", "station"]], hide_index=True, use_container_width=True)
+        for title, plays_list in sorted(by_title.items()):
+            new_count = sum(1 for p in plays_list if p["nowa"])
+            label = f"🎵 {title} ({len(plays_list)} emisji"
+            label += f", 🆕 {new_count} nowych)" if new_count else ")"
+            with st.expander(label, expanded=True):
+                df_show = pd.DataFrame(sorted(plays_list, key=lambda x: (x["data"], x["godzina"])))
+                st.dataframe(
+                    df_show[["data", "godzina", "stacja", "nowa"]],
+                    hide_index=True, use_container_width=True,
+                )
 
-        # Zapis do CSV
-        df = pd.DataFrame(all_new_plays)
-        df["wykryto"] = datetime.now().strftime("%d.%m.%Y %H:%M")
-
-        if os.path.exists(NEW_PLAYS_FILE):
-            existing = pd.read_csv(NEW_PLAYS_FILE, encoding="utf-8-sig")
-            df_out = pd.concat([existing, df], ignore_index=True)
-        else:
-            df_out = df
-
-        df_out.to_csv(NEW_PLAYS_FILE, index=False, encoding="utf-8-sig")
-        st.success(f"💾 Zapisano do: {NEW_PLAYS_FILE}")
+        df_all = pd.DataFrame(final_plays)
+        df_all["wykryto"] = datetime.now().strftime("%d.%m.%Y %H:%M")
 
         st.download_button(
-            "⬇️ Pobierz nowe emisje (CSV)",
-            data=df.to_csv(index=False, encoding="utf-8-sig"),
-            file_name=f"kamil_pivot_nowe_emisje_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+            "⬇️ Pobierz wszystkie emisje z okresu (CSV)",
+            data=df_all.to_csv(index=False, encoding="utf-8-sig"),
+            file_name=f"kamil_pivot_emisje_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
             mime="text/csv",
         )
 
-    # Aktualizacja bazy
-    updated_known = known_plays | all_current_plays
+    # Aktualizacja bazy "znanych" emisji (do oznaczania 🆕 przy kolejnym uruchomieniu)
+    updated_known = known_plays | all_current_keys
     save_known_plays(updated_known)
-    st.info(f"💾 Zaktualizowano bazę: {len(updated_known)} rekordów → {KNOWN_PLAYS_FILE}")
+    st.info(f"💾 Zaktualizowano bazę znanych emisji: {len(updated_known)} rekordów")
